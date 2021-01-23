@@ -168,7 +168,7 @@ static const struct nv_cmd {
   { NL,        nv_down,        0,                      false },
   { Ctrl_K,    nv_error,       0,                      0 },
   { Ctrl_L,    nv_clear,       0,                      0 },
-  { Ctrl_M,    nv_down,        0,                      true },
+  { CAR,       nv_down,        0,                      true },
   { Ctrl_N,    nv_down,        NV_STS,                 false },
   { Ctrl_O,    nv_ctrlo,       0,                      0 },
   { Ctrl_P,    nv_up,          NV_STS,                 false },
@@ -621,6 +621,8 @@ static void normal_redraw_mode_message(NormalState *s)
     update_screen(0);
     // now reset it, otherwise it's put in the history again
     keep_msg = kmsg;
+
+    kmsg = vim_strsave(keep_msg);
     msg_attr((const char *)kmsg, keep_msg_attr);
     xfree(kmsg);
   }
@@ -900,6 +902,10 @@ static void normal_finish_command(NormalState *s)
 normal_end:
 
   msg_nowait = false;
+
+  if (finish_op) {
+    set_reg_var(get_default_register_name());
+  }
 
   // Reset finish_op, in case it was set
   s->c = finish_op;
@@ -1191,6 +1197,15 @@ static void normal_check_interrupt(NormalState *s)
   }
 }
 
+static void normal_check_window_scrolled(NormalState *s)
+{
+  // Trigger Scroll if the viewport changed.
+  if (!finish_op && has_event(EVENT_WINSCROLLED)
+      && win_did_scroll(curwin)) {
+    do_autocmd_winscrolled(curwin);
+  }
+}
+
 static void normal_check_cursor_moved(NormalState *s)
 {
   // Trigger CursorMoved if the cursor moved.
@@ -1211,6 +1226,16 @@ static void normal_check_text_changed(NormalState *s)
       && curbuf->b_last_changedtick != buf_get_changedtick(curbuf)) {
     apply_autocmds(EVENT_TEXTCHANGED, NULL, NULL, false, curbuf);
     curbuf->b_last_changedtick = buf_get_changedtick(curbuf);
+  }
+}
+
+static void normal_check_buffer_modified(NormalState *s)
+{
+  // Trigger BufModified if b_modified changed
+  if (!finish_op && has_event(EVENT_BUFMODIFIEDSET)
+      && curbuf->b_changed_invalid == true) {
+    apply_autocmds(EVENT_BUFMODIFIEDSET, NULL, NULL, false, curbuf);
+    curbuf->b_changed_invalid = false;
   }
 }
 
@@ -1236,7 +1261,7 @@ static void normal_redraw(NormalState *s)
 {
   // Before redrawing, make sure w_topline is correct, and w_leftcol
   // if lines don't wrap, and w_skipcol if lines wrap.
-  update_topline();
+  update_topline(curwin);
   validate_cursor();
 
   // If the cursor moves horizontally when 'concealcursor' is active, then the
@@ -1265,10 +1290,15 @@ static void normal_redraw(NormalState *s)
   // Display message after redraw. If an external message is still visible,
   // it contains the kept message already.
   if (keep_msg != NULL && !msg_ext_is_visible()) {
-    // msg_attr_keep() will set keep_msg to NULL, must free the string here.
-    // Don't reset keep_msg, msg_attr_keep() uses it to check for duplicates.
-    char *p = (char *)keep_msg;
-    msg_attr(p, keep_msg_attr);
+    char_u *const p = vim_strsave(keep_msg);
+
+    // msg_start() will set keep_msg to NULL, make a copy
+    // first.  Don't reset keep_msg, msg_attr_keep() uses it to
+    // check for duplicates.  Never put this message in
+    // history.
+    msg_hist_off = true;
+    msg_attr((const char *)p, keep_msg_attr);
+    msg_hist_off = false;
     xfree(p);
   }
 
@@ -1309,8 +1339,14 @@ static int normal_check(VimState *state)
   if (skip_redraw || exmode_active) {
     skip_redraw = false;
   } else if (do_redraw || stuff_empty()) {
+    // Need to make sure w_topline and w_leftcol are correct before
+    // normal_check_window_scrolled() is called.
+    update_topline(curwin);
+
     normal_check_cursor_moved(s);
     normal_check_text_changed(s);
+    normal_check_window_scrolled(s);
+    normal_check_buffer_modified(s);
 
     // Updating diffs from changed() does not always work properly,
     // esp. updating folds.  Do an update just before redrawing if
@@ -1449,7 +1485,8 @@ void do_pending_operator(cmdarg_T *cap, int old_col, bool gui_yank)
     if ((redo_yank || oap->op_type != OP_YANK)
         && ((!VIsual_active || oap->motion_force)
             // Also redo Operator-pending Visual mode mappings.
-            || (cap->cmdchar == ':' && oap->op_type != OP_COLON))
+            || ((cap->cmdchar == ':' || cap->cmdchar == K_COMMAND)
+                && oap->op_type != OP_COLON))
         && cap->cmdchar != 'D'
         && oap->op_type != OP_FOLD
         && oap->op_type != OP_FOLDOPEN
@@ -1642,7 +1679,7 @@ void do_pending_operator(cmdarg_T *cap, int old_col, bool gui_yank)
           prep_redo(oap->regname, cap->count0,
                     get_op_char(oap->op_type), get_extra_op_char(oap->op_type),
                     oap->motion_force, cap->cmdchar, cap->nchar);
-        } else if (cap->cmdchar != ':') {
+        } else if (cap->cmdchar != ':' && cap->cmdchar != K_COMMAND) {
           int nchar = oap->op_type == OP_REPLACE ? cap->nchar : NUL;
 
           // reverse what nv_replace() did
@@ -1810,13 +1847,12 @@ void do_pending_operator(cmdarg_T *cap, int old_col, bool gui_yank)
         CancelRedo();
       } else {
         (void)op_delete(oap);
-        if (oap->motion_type == kMTLineWise && has_format_option(FO_AUTO)) {
-          // cursor line wasn't saved yet
-          if (u_save_cursor() == FAIL) {
-            break;
-          }
+        // save cursor line for undo if it wasn't saved yet
+        if (oap->motion_type == kMTLineWise
+            && has_format_option(FO_AUTO)
+            && u_save_cursor() == OK) {
+          auto_format(false, true);
         }
-        auto_format(false, true);
       }
       break;
 
@@ -1970,20 +2006,20 @@ void do_pending_operator(cmdarg_T *cap, int old_col, bool gui_yank)
 
     case OP_FOLD:
       VIsual_reselect = false;          // don't reselect now
-      foldCreate(curwin, oap->start.lnum, oap->end.lnum);
+      foldCreate(curwin, oap->start, oap->end);
       break;
 
     case OP_FOLDOPEN:
     case OP_FOLDOPENREC:
     case OP_FOLDCLOSE:
     case OP_FOLDCLOSEREC:
-      VIsual_reselect = false;          /* don't reselect now */
-      opFoldRange(oap->start.lnum, oap->end.lnum,
-          oap->op_type == OP_FOLDOPEN
-          || oap->op_type == OP_FOLDOPENREC,
-          oap->op_type == OP_FOLDOPENREC
-          || oap->op_type == OP_FOLDCLOSEREC,
-          oap->is_VIsual);
+      VIsual_reselect = false;          // don't reselect now
+      opFoldRange(oap->start, oap->end,
+                  oap->op_type == OP_FOLDOPEN
+                  || oap->op_type == OP_FOLDOPENREC,
+                  oap->op_type == OP_FOLDOPENREC
+                  || oap->op_type == OP_FOLDCLOSEREC,
+                  oap->is_VIsual);
       break;
 
     case OP_FOLDDEL:
@@ -2339,10 +2375,10 @@ do_mouse (
      * Also paste at the cursor if the current mode isn't in 'mouse' (only
      * happens for the GUI).
      */
-    if ((State & INSERT) || !mouse_has(MOUSE_NORMAL)) {
-      if (regname == '.')
+    if ((State & INSERT)) {
+      if (regname == '.') {
         insert_reg(regname, true);
-      else {
+      } else {
         if (regname == 0 && eval_has_provider("clipboard")) {
           regname = '*';
         }
@@ -2476,7 +2512,7 @@ do_mouse (
           typval_T rettv;
           int doesrange;
           (void)call_func((char_u *)tab_page_click_defs[mouse_col].func,
-                          (int)strlen(tab_page_click_defs[mouse_col].func),
+                          -1,
                           &rettv, ARRAY_SIZE(argv), argv, NULL,
                           curwin->w_cursor.lnum, curwin->w_cursor.lnum,
                           &doesrange, true, NULL, NULL);
@@ -2522,8 +2558,9 @@ do_mouse (
          * on a status line */
         if (VIsual_active)
           jump_flags |= MOUSE_MAY_STOP_VIS;
-      } else if (mouse_has(MOUSE_VISUAL))
+      } else {
         jump_flags |= MOUSE_MAY_VIS;
+      }
     } else if (which_button == MOUSE_RIGHT) {
       if (is_click && VIsual_active) {
         /*
@@ -2539,8 +2576,7 @@ do_mouse (
         }
       }
       jump_flags |= MOUSE_FOCUS;
-      if (mouse_has(MOUSE_VISUAL))
-        jump_flags |= MOUSE_MAY_VIS;
+      jump_flags |= MOUSE_MAY_VIS;
     }
   }
 
@@ -2564,11 +2600,6 @@ do_mouse (
                              oap == NULL ? NULL : &(oap->inclusive),
                              which_button);
 
-  // A click in the window toolbar has no side effects.
-  if (jump_flags & MOUSE_WINBAR) {
-    return false;
-  }
-
   moved = (jump_flags & CURSOR_MOVED);
   in_status_line = (jump_flags & IN_STATUS_LINE);
   in_sep_line = (jump_flags & IN_SEP_LINE);
@@ -2583,20 +2614,22 @@ do_mouse (
       && !is_drag
       && (jump_flags & (MOUSE_FOLD_CLOSE | MOUSE_FOLD_OPEN))
       && which_button == MOUSE_LEFT) {
-    /* open or close a fold at this line */
-    if (jump_flags & MOUSE_FOLD_OPEN)
-      openFold(curwin->w_cursor.lnum, 1L);
-    else
-      closeFold(curwin->w_cursor.lnum, 1L);
-    /* don't move the cursor if still in the same window */
-    if (curwin == old_curwin)
+    // open or close a fold at this line
+    if (jump_flags & MOUSE_FOLD_OPEN) {
+      openFold(curwin->w_cursor, 1L);
+    } else {
+      closeFold(curwin->w_cursor, 1L);
+    }
+    // don't move the cursor if still in the same window
+    if (curwin == old_curwin) {
       curwin->w_cursor = save_cursor;
+    }
   }
 
 
   /* Set global flag that we are extending the Visual area with mouse
    * dragging; temporarily minimize 'scrolloff'. */
-  if (VIsual_active && is_drag && get_scrolloff_value()) {
+  if (VIsual_active && is_drag && get_scrolloff_value(curwin)) {
     // In the very first line, allow scrolling one line
     if (mouse_row == 0) {
       mouse_dragging = 2;
@@ -2757,8 +2790,7 @@ do_mouse (
   /* Handle double clicks, unless on status line */
   else if (in_status_line) {
   } else if (in_sep_line) {
-  } else if ((mod_mask & MOD_MASK_MULTI_CLICK) && (State & (NORMAL | INSERT))
-             && mouse_has(MOUSE_VISUAL)) {
+  } else if ((mod_mask & MOD_MASK_MULTI_CLICK) && (State & (NORMAL | INSERT))) {
     if (is_click || !VIsual_active) {
       if (VIsual_active) {
         orig_cursor = VIsual;
@@ -3019,57 +3051,57 @@ static bool find_is_eval_item(
   return false;
 }
 
-/*
- * Find the identifier under or to the right of the cursor.
- * "find_type" can have one of three values:
- * FIND_IDENT:   find an identifier (keyword)
- * FIND_STRING:  find any non-white string
- * FIND_IDENT + FIND_STRING: find any non-white string, identifier preferred.
- * FIND_EVAL:	 find text useful for C program debugging
- *
- * There are three steps:
- * 1. Search forward for the start of an identifier/string.  Doesn't move if
- *    already on one.
- * 2. Search backward for the start of this identifier/string.
- *    This doesn't match the real Vi but I like it a little better and it
- *    shouldn't bother anyone.
- * 3. Search forward to the end of this identifier/string.
- *    When FIND_IDENT isn't defined, we backup until a blank.
- *
- * Returns the length of the string, or zero if no string is found.
- * If a string is found, a pointer to the string is put in "*string".  This
- * string is not always NUL terminated.
- */
-size_t find_ident_under_cursor(char_u **string, int find_type)
+// Find the identifier under or to the right of the cursor.
+// "find_type" can have one of three values:
+// FIND_IDENT:   find an identifier (keyword)
+// FIND_STRING:  find any non-white text
+// FIND_IDENT + FIND_STRING: find any non-white text, identifier preferred.
+// FIND_EVAL:  find text useful for C program debugging
+//
+// There are three steps:
+// 1. Search forward for the start of an identifier/text.  Doesn't move if
+//    already on one.
+// 2. Search backward for the start of this identifier/text.
+//    This doesn't match the real Vi but I like it a little better and it
+//    shouldn't bother anyone.
+// 3. Search forward to the end of this identifier/text.
+//    When FIND_IDENT isn't defined, we backup until a blank.
+//
+// Returns the length of the text, or zero if no text is found.
+// If text is found, a pointer to the text is put in "*text".  This
+// points into the current buffer line and is not always NUL terminated.
+size_t find_ident_under_cursor(char_u **text, int find_type)
+  FUNC_ATTR_NONNULL_ARG(1)
 {
   return find_ident_at_pos(curwin, curwin->w_cursor.lnum,
-      curwin->w_cursor.col, string, find_type);
+                           curwin->w_cursor.col, text, NULL, find_type);
 }
 
 /*
  * Like find_ident_under_cursor(), but for any window and any position.
  * However: Uses 'iskeyword' from the current window!.
  */
-size_t find_ident_at_pos(win_T *wp, linenr_T lnum, colnr_T startcol,
-                         char_u **string, int find_type)
+size_t find_ident_at_pos(
+    win_T *wp,
+    linenr_T lnum,
+    colnr_T startcol,
+    char_u **text,
+    int *textcol,      // column where "text" starts, can be NULL
+    int find_type)
+  FUNC_ATTR_NONNULL_ARG(1, 4)
 {
-  char_u      *ptr;
-  int col = 0;                      /* init to shut up GCC */
+  int col = 0;         // init to shut up GCC
   int i;
   int this_class = 0;
   int prev_class;
   int prevcol;
   int bn = 0;                       // bracket nesting
 
-  /*
-   * if i == 0: try to find an identifier
-   * if i == 1: try to find any non-white string
-   */
-  ptr = ml_get_buf(wp->w_buffer, lnum, false);
-  for (i = (find_type & FIND_IDENT) ? 0 : 1; i < 2; ++i) {
-    /*
-     * 1. skip to start of identifier/string
-     */
+  // if i == 0: try to find an identifier
+  // if i == 1: try to find any non-white text
+  char_u *ptr = ml_get_buf(wp->w_buffer, lnum, false);
+  for (i = (find_type & FIND_IDENT) ? 0 : 1; i < 2; i++) {
+    // 1. skip to start of identifier/text
     col = startcol;
     while (ptr[col] != NUL) {
       // Stop at a ']' to evaluate "a[x]".
@@ -3087,7 +3119,7 @@ size_t find_ident_at_pos(win_T *wp, linenr_T lnum, colnr_T startcol,
     bn = ptr[col] == ']';
 
     //
-    // 2. Back up to start of identifier/string.
+    // 2. Back up to start of identifier/text.
     //
     // Remember class of character under cursor.
     if ((find_type & FIND_EVAL) && ptr[col] == ']') {
@@ -3110,7 +3142,7 @@ size_t find_ident_at_pos(win_T *wp, linenr_T lnum, colnr_T startcol,
       col = prevcol;
     }
 
-    // If we don't want just any old string, or we've found an
+    // If we don't want just any old text, or we've found an
     // identifier, stop searching.
     if (this_class > 2) {
       this_class = 2;
@@ -3121,7 +3153,7 @@ size_t find_ident_at_pos(win_T *wp, linenr_T lnum, colnr_T startcol,
   }
 
   if (ptr[col] == NUL || (i == 0 && this_class != 2)) {
-    // Didn't find an identifier or string.
+    // Didn't find an identifier or text.
     if (find_type & FIND_STRING) {
       EMSG(_("E348: No string under cursor"));
     } else {
@@ -3130,11 +3162,12 @@ size_t find_ident_at_pos(win_T *wp, linenr_T lnum, colnr_T startcol,
     return 0;
   }
   ptr += col;
-  *string = ptr;
+  *text = ptr;
+  if (textcol != NULL) {
+    *textcol = col;
+  }
 
-  /*
-   * 3. Find the end if the identifier/string.
-   */
+  // 3. Find the end if the identifier/text.
   bn = 0;
   startcol -= col;
   col = 0;
@@ -3592,7 +3625,7 @@ void check_scrollbind(linenr_T topline_diff, long leftcol_diff)
           scrolldown(-y, false);
       }
 
-      redraw_later(VALID);
+      redraw_later(curwin, VALID);
       cursor_correct();
       curwin->w_redr_status = true;
     }
@@ -3945,16 +3978,19 @@ static bool nv_screengo(oparg_T *oap, int dir, long dist)
           curwin->w_curswant -= width2;
         } else {
           // to previous line
+
+          // Move to the start of a closed fold.  Don't do that when
+          // 'foldopen' contains "all": it will open in a moment.
+          if (!(fdo_flags & FDO_ALL)) {
+            (void)hasFolding(curwin->w_cursor.lnum,
+                             &curwin->w_cursor.lnum, NULL);
+          }
           if (curwin->w_cursor.lnum == 1) {
             retval = false;
             break;
           }
-          --curwin->w_cursor.lnum;
-          /* Move to the start of a closed fold.  Don't do that when
-           * 'foldopen' contains "all": it will open in a moment. */
-          if (!(fdo_flags & FDO_ALL))
-            (void)hasFolding(curwin->w_cursor.lnum,
-                &curwin->w_cursor.lnum, NULL);
+          curwin->w_cursor.lnum--;
+
           linelen = linetabsize(get_cursor_line_ptr());
           if (linelen > width1) {
             int w = (((linelen - width1 - 1) / width2) + 1) * width2;
@@ -4098,11 +4134,11 @@ void scroll_redraw(int up, long count)
   int prev_topfill = curwin->w_topfill;
   linenr_T prev_lnum = curwin->w_cursor.lnum;
 
-  if (up)
-    scrollup(count, true);
-  else
+  bool moved = up ?
+    scrollup(count, true) :
     scrolldown(count, true);
-  if (get_scrolloff_value()) {
+
+  if (get_scrolloff_value(curwin)) {
     // Adjust the cursor position for 'scrolloff'.  Mark w_topline as
     // valid, otherwise the screen jumps back at the end of the file.
     cursor_correct();
@@ -4131,10 +4167,13 @@ void scroll_redraw(int up, long count)
       curwin->w_valid |= VALID_TOPLINE;
     }
   }
-  if (curwin->w_cursor.lnum != prev_lnum)
+  if (curwin->w_cursor.lnum != prev_lnum) {
     coladvance(curwin->w_curswant);
-  curwin->w_viewport_invalid = true;
-  redraw_later(VALID);
+  }
+  if (moved) {
+    curwin->w_viewport_invalid = true;
+  }
+  redraw_later(curwin, VALID);
 }
 
 /*
@@ -4149,7 +4188,7 @@ static void nv_zet(cmdarg_T *cap)
   int old_fen = curwin->w_p_fen;
   bool undo = false;
 
-  int l_p_siso = (int)get_sidescrolloff_value();
+  int l_p_siso = (int)get_sidescrolloff_value(curwin);
   assert(l_p_siso <= INT_MAX);
 
   if (ascii_isdigit(nchar)) {
@@ -4217,12 +4256,13 @@ dozet:
   /* "z+", "z<CR>" and "zt": put cursor at top of screen */
   case '+':
     if (cap->count0 == 0) {
-      /* No count given: put cursor at the line below screen */
-      validate_botline();               /* make sure w_botline is valid */
-      if (curwin->w_botline > curbuf->b_ml.ml_line_count)
+      // No count given: put cursor at the line below screen
+      validate_botline(curwin);               // make sure w_botline is valid
+      if (curwin->w_botline > curbuf->b_ml.ml_line_count) {
         curwin->w_cursor.lnum = curbuf->b_ml.ml_line_count;
-      else
+      } else {
         curwin->w_cursor.lnum = curwin->w_botline;
+      }
     }
     FALLTHROUGH;
   case NL:
@@ -4232,7 +4272,7 @@ dozet:
     FALLTHROUGH;
 
   case 't':   scroll_cursor_top(0, true);
-    redraw_later(VALID);
+    redraw_later(curwin, VALID);
     set_fraction(curwin);
     break;
 
@@ -4241,7 +4281,7 @@ dozet:
   FALLTHROUGH;
 
   case 'z':   scroll_cursor_halfway(true);
-    redraw_later(VALID);
+    redraw_later(curwin, VALID);
     set_fraction(curwin);
     break;
 
@@ -4262,7 +4302,7 @@ dozet:
     FALLTHROUGH;
 
   case 'b':   scroll_cursor_bot(0, true);
-    redraw_later(VALID);
+    redraw_later(curwin, VALID);
     set_fraction(curwin);
     break;
 
@@ -4309,7 +4349,7 @@ dozet:
         col = 0;
       if (curwin->w_leftcol != col) {
         curwin->w_leftcol = col;
-        redraw_later(NOT_VALID);
+        redraw_later(curwin, NOT_VALID);
       }
   }
     break;
@@ -4328,7 +4368,7 @@ dozet:
       }
       if (curwin->w_leftcol != col) {
         curwin->w_leftcol = col;
-        redraw_later(NOT_VALID);
+        redraw_later(curwin, NOT_VALID);
       }
   }
     break;
@@ -4386,51 +4426,55 @@ dozet:
   case 'i':   curwin->w_p_fen = !curwin->w_p_fen;
     break;
 
-  /* "za": open closed fold or close open fold at cursor */
-  case 'a':   if (hasFolding(curwin->w_cursor.lnum, NULL, NULL))
-      openFold(curwin->w_cursor.lnum, cap->count1);
-    else {
-      closeFold(curwin->w_cursor.lnum, cap->count1);
+  // "za": open closed fold or close open fold at cursor
+  case 'a':   if (hasFolding(curwin->w_cursor.lnum, NULL, NULL)) {
+      openFold(curwin->w_cursor, cap->count1);
+    } else {
+      closeFold(curwin->w_cursor, cap->count1);
       curwin->w_p_fen = true;
     }
     break;
 
-  /* "zA": open fold at cursor recursively */
-  case 'A':   if (hasFolding(curwin->w_cursor.lnum, NULL, NULL))
-      openFoldRecurse(curwin->w_cursor.lnum);
-    else {
-      closeFoldRecurse(curwin->w_cursor.lnum);
+  // "zA": open fold at cursor recursively
+  case 'A':   if (hasFolding(curwin->w_cursor.lnum, NULL, NULL)) {
+      openFoldRecurse(curwin->w_cursor);
+    } else {
+      closeFoldRecurse(curwin->w_cursor);
       curwin->w_p_fen = true;
     }
     break;
 
-  /* "zo": open fold at cursor or Visual area */
-  case 'o':   if (VIsual_active)
+  // "zo": open fold at cursor or Visual area
+  case 'o':   if (VIsual_active) {
       nv_operator(cap);
-    else
-      openFold(curwin->w_cursor.lnum, cap->count1);
+    } else {
+      openFold(curwin->w_cursor, cap->count1);
+    }
     break;
 
-  /* "zO": open fold recursively */
-  case 'O':   if (VIsual_active)
+  // "zO": open fold recursively
+  case 'O':   if (VIsual_active) {
       nv_operator(cap);
-    else
-      openFoldRecurse(curwin->w_cursor.lnum);
+    } else {
+      openFoldRecurse(curwin->w_cursor);
+    }
     break;
 
-  /* "zc": close fold at cursor or Visual area */
-  case 'c':   if (VIsual_active)
+  // "zc": close fold at cursor or Visual area
+  case 'c':   if (VIsual_active) {
       nv_operator(cap);
-    else
-      closeFold(curwin->w_cursor.lnum, cap->count1);
+              } else {
+      closeFold(curwin->w_cursor, cap->count1);
+    }
     curwin->w_p_fen = true;
     break;
 
-  /* "zC": close fold recursively */
-  case 'C':   if (VIsual_active)
+  // "zC": close fold recursively
+  case 'C':   if (VIsual_active) {
       nv_operator(cap);
-    else
-      closeFoldRecurse(curwin->w_cursor.lnum);
+    } else {
+      closeFoldRecurse(curwin->w_cursor);
+    }
     curwin->w_p_fen = true;
     break;
 
@@ -4677,7 +4721,7 @@ static void nv_clear(cmdarg_T *cap)
     FOR_ALL_WINDOWS_IN_TAB(wp, curtab) {
       wp->w_s->b_syn_slow = false;
     }
-    redraw_later(CLEAR);
+    redraw_later(curwin, CLEAR);
   }
 }
 
@@ -5013,7 +5057,7 @@ static void nv_scroll(cmdarg_T *cap)
   setpcmark();
 
   if (cap->cmdchar == 'L') {
-    validate_botline();             /* make sure curwin->w_botline is valid */
+    validate_botline(curwin);          // make sure curwin->w_botline is valid
     curwin->w_cursor.lnum = curwin->w_botline - 1;
     if (cap->count1 - 1 >= curwin->w_cursor.lnum)
       curwin->w_cursor.lnum = 1;
@@ -5034,7 +5078,7 @@ static void nv_scroll(cmdarg_T *cap)
       /* Don't count filler lines above the window. */
       used -= diff_check_fill(curwin, curwin->w_topline)
               - curwin->w_topfill;
-      validate_botline();  // make sure w_empty_rows is valid
+      validate_botline(curwin);  // make sure w_empty_rows is valid
       half = (curwin->w_height_inner - curwin->w_empty_rows + 1) / 2;
       for (n = 0; curwin->w_topline + n < curbuf->b_ml.ml_line_count; n++) {
         // Count half he number of filler lines to be "below this
@@ -6613,16 +6657,15 @@ static void nv_g_cmd(cmdarg_T *cap)
       VIsual = curwin->w_cursor;
       curwin->w_cursor = tpos;
       check_cursor();
-      update_topline();
-      /*
-       * When called from normal "g" command: start Select mode when
-       * 'selectmode' contains "cmd".  When called for K_SELECT, always
-       * start Select mode.
-       */
-      if (cap->arg)
+      update_topline(curwin);
+      // When called from normal "g" command: start Select mode when
+      // 'selectmode' contains "cmd".  When called for K_SELECT, always
+      // start Select mode.
+      if (cap->arg) {
         VIsual_select = true;
-      else
+      } else {
         may_start_select('c');
+      }
       setmouse();
       redraw_curbuf_later(INVERTED);
       showmode();
@@ -6668,11 +6711,8 @@ static void nv_g_cmd(cmdarg_T *cap)
    */
   case 'j':
   case K_DOWN:
-    /* with 'nowrap' it works just like the normal "j" command; also when
-     * in a closed fold */
-    if (!curwin->w_p_wrap
-        || hasFolding(curwin->w_cursor.lnum, NULL, NULL)
-        ) {
+    // with 'nowrap' it works just like the normal "j" command.
+    if (!curwin->w_p_wrap) {
       oap->motion_type = kMTLineWise;
       i = cursor_down(cap->count1, oap->op_type == OP_NOP);
     } else
@@ -6683,11 +6723,8 @@ static void nv_g_cmd(cmdarg_T *cap)
 
   case 'k':
   case K_UP:
-    /* with 'nowrap' it works just like the normal "k" command; also when
-     * in a closed fold */
-    if (!curwin->w_p_wrap
-        || hasFolding(curwin->w_cursor.lnum, NULL, NULL)
-        ) {
+    // with 'nowrap' it works just like the normal "k" command.
+    if (!curwin->w_p_wrap) {
       oap->motion_type = kMTLineWise;
       i = cursor_up(cap->count1, oap->op_type == OP_NOP);
     } else
@@ -6828,7 +6865,7 @@ static void nv_g_cmd(cmdarg_T *cap)
     } else {
       if (cap->count1 > 1) {
         // if it fails, let the cursor still move to the last char
-        cursor_down(cap->count1 - 1, false);
+        (void)cursor_down(cap->count1 - 1, false);
       }
       i = curwin->w_leftcol + curwin->w_width_inner - col_off - 1;
       coladvance((colnr_T)i);

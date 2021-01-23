@@ -109,6 +109,23 @@ function tests.basic_init()
   }
 end
 
+function tests.check_workspace_configuration()
+  skeleton {
+    on_init = function(_params)
+      return { capabilities = {} }
+    end;
+    body = function()
+      notify('start')
+      notify('workspace/configuration', { items = {
+              { section = "testSetting1" };
+              { section = "testSetting2" };
+          } })
+      expect_notification('workspace/configuration', { true; vim.NIL})
+      notify('shutdown')
+    end;
+  }
+end
+
 function tests.basic_check_capabilities()
   skeleton {
     on_init = function(params)
@@ -117,6 +134,26 @@ function tests.basic_check_capabilities()
       return {
         capabilities = {
           textDocumentSync = protocol.TextDocumentSyncKind.Full;
+        }
+      }
+    end;
+    body = function()
+    end;
+  }
+end
+
+function tests.capabilities_for_client_supports_method()
+  skeleton {
+    on_init = function(params)
+      local expected_capabilities = protocol.make_client_capabilities()
+      assert_eq(params.capabilities, expected_capabilities)
+      return {
+        capabilities = {
+          textDocumentSync = protocol.TextDocumentSyncKind.Full;
+          completionProvider = true;
+          hoverProvider = true;
+          definitionProvider = false;
+          referencesProvider = false;
         }
       }
     end;

@@ -15,14 +15,8 @@ func Test_sign()
   " icon is ignored when not supported.  "(not supported)" is shown after
   " the icon name when listing signs.
   sign define Sign1 text=x
-  try
-    sign define Sign2 text=xy texthl=Title linehl=Error
-		\ icon=../../pixmaps/stock_vim_find_help.png
-  catch /E255:/
-    " Ignore error: E255: Couldn't read in sign data!
-    " This error can happen when running in the GUI.
-    " Some gui like Motif do not support the png icon format.
-  endtry
+
+  call Sign_command_ignore_error('sign define Sign2 text=xy texthl=Title linehl=Error icon=../../pixmaps/stock_vim_find_help.png')
 
   " Test listing signs.
   let a=execute('sign list')
@@ -104,12 +98,7 @@ func Test_sign()
   edit foo
   call setline(1, ['A', 'B', 'C', 'D'])
 
-  try
-    sign define Sign3 text=y texthl=DoesNotExist linehl=DoesNotExist
-		\ icon=doesnotexist.xpm
-  catch /E255:/
-    " ignore error: E255: it can happens for guis.
-  endtry
+  call Sign_command_ignore_error('sign define Sign3 text=y texthl=DoesNotExist linehl=DoesNotExist icon=doesnotexist.xpm')
 
   let fn = expand('%:p')
   exe 'sign place 43 line=2 name=Sign3 file=' . fn
@@ -133,9 +122,9 @@ func Test_sign()
   call assert_fails("sign define Sign4 text=a\e linehl=Comment", 'E239:')
   call assert_fails("sign define Sign4 text=\ea linehl=Comment", 'E239:')
 
-  " Only 1 or 2 character text is allowed
+  " Only 0, 1 or 2 character text is allowed
   call assert_fails("sign define Sign4 text=abc linehl=Comment", 'E239:')
-  call assert_fails("sign define Sign4 text= linehl=Comment", 'E239:')
+  " call assert_fails("sign define Sign4 text= linehl=Comment", 'E239:')
   call assert_fails("sign define Sign4 text=\\ ab  linehl=Comment", 'E239:')
 
   " define sign with whitespace
@@ -317,7 +306,7 @@ func Test_sign_invalid_commands()
   call assert_fails('sign jump 1 name=', 'E474:')
   call assert_fails('sign jump 1 name=Sign1', 'E474:')
   call assert_fails('sign jump 1 line=100', '474:')
-  call assert_fails('sign define Sign2 text=', 'E239:')
+  " call assert_fails('sign define Sign2 text=', 'E239:')
   " Non-numeric identifier for :sign place
   call assert_fails("sign place abc line=3 name=Sign1 buffer=" . bufnr(''),
 								\ 'E474:')
@@ -378,6 +367,25 @@ func Test_sign_delete_buffer()
   sign undefine Sign
 endfunc
 
+" Ignore error: E255: Couldn't read in sign data!
+" This error can happen when running in the GUI.
+" Some gui like Motif do not support the png icon format.
+func Sign_command_ignore_error(cmd)
+  try
+    exe a:cmd
+  catch /E255:/
+  endtry
+endfunc
+
+" ignore error: E255: Couldn't read in sign data!
+" This error can happen when running in gui.
+func Sign_define_ignore_error(name, attr)
+  try
+    call sign_define(a:name, a:attr)
+  catch /E255:/
+  endtry
+endfunc
+
 " Test for Vim script functions for managing signs
 func Test_sign_funcs()
   " Remove all the signs
@@ -394,12 +402,7 @@ func Test_sign_funcs()
   call sign_define("sign2")
   let attr = {'text' : '!!', 'linehl' : 'DiffAdd', 'texthl' : 'DiffChange',
 	      \ 'icon' : 'sign2.ico'}
-  try
-    call sign_define("sign2", attr)
-  catch /E255:/
-    " ignore error: E255: Couldn't read in sign data!
-    " This error can happen when running in gui.
-  endtry
+  call Sign_define_ignore_error("sign2", attr)
   call assert_equal([{'name' : 'sign2', 'texthl' : 'DiffChange',
 	      \ 'linehl' : 'DiffAdd', 'text' : '!!', 'icon' : 'sign2.ico'}],
 	      \ sign_getdefined("sign2"))
@@ -412,7 +415,7 @@ func Test_sign_funcs()
 
   " Tests for invalid arguments to sign_define()
   call assert_fails('call sign_define("sign4", {"text" : "===>"})', 'E239:')
-  call assert_fails('call sign_define("sign5", {"text" : ""})', 'E239:')
+  " call assert_fails('call sign_define("sign5", {"text" : ""})', 'E239:')
   call assert_fails('call sign_define([])', 'E730:')
   call assert_fails('call sign_define("sign6", [])', 'E715:')
 
@@ -507,6 +510,16 @@ func Test_sign_funcs()
   call assert_equal([], sign_getdefined("sign1"))
   call assert_fails('call sign_undefine("none")', 'E155:')
   call assert_fails('call sign_undefine([])', 'E730:')
+
+  " Test for using '.' as the line number for sign_place()
+  call Sign_define_ignore_error("sign1", attr)
+  call cursor(22, 1)
+  call assert_equal(15, sign_place(15, '', 'sign1', 'Xsign',
+	      \ {'lnum' : '.'}))
+  call assert_equal([{'bufnr' : bufnr(''), 'signs' :
+	      \ [{'id' : 15, 'group' : '', 'lnum' : 22, 'name' : 'sign1',
+	      \ 'priority' : 10}]}],
+	      \ sign_getplaced('%', {'lnum' : 22}))
 
   call delete("Xsign")
   call sign_unplace('*')
@@ -1741,4 +1754,118 @@ func Test_sign_cursor_position()
   " clean up
   call StopVimInTerminal(buf)
   call delete('XtestSigncolumn')
+endfunc
+
+" Return the 'len' characters in screen starting from (row,col)
+func s:ScreenLine(row, col, len)
+  let s = ''
+  for i in range(a:len)
+    let s .= nr2char(screenchar(a:row, a:col + i))
+  endfor
+  return s
+endfunc
+
+" Test for 'signcolumn' set to 'number'.
+func Test_sign_numcol()
+  new
+  call append(0, "01234")
+  " With 'signcolumn' set to 'number', make sure sign is displayed in the
+  " number column and line number is not displayed.
+  set numberwidth=2
+  set number
+  set signcolumn=number
+  sign define sign1 text==>
+  sign place 10 line=1 name=sign1
+  sign define sign2 text=Ｖ
+  redraw!
+  call assert_equal("=> 01234", s:ScreenLine(1, 1, 8))
+
+  " With 'signcolumn' set to 'number', when there is no sign, make sure line
+  " number is displayed in the number column
+  sign unplace 10
+  redraw!
+  call assert_equal("1 01234", s:ScreenLine(1, 1, 7))
+
+  " Disable number column. Check whether sign is displayed in the sign column
+  set numberwidth=4
+  set nonumber
+  sign place 10 line=1 name=sign1
+  redraw!
+  call assert_equal("=>01234", s:ScreenLine(1, 1, 7))
+
+  " Enable number column. Check whether sign is displayed in the number column
+  set number
+  redraw!
+  call assert_equal(" => 01234", s:ScreenLine(1, 1, 9))
+
+  " Disable sign column. Make sure line number is displayed
+  set signcolumn=no
+  redraw!
+  call assert_equal("  1 01234", s:ScreenLine(1, 1, 9))
+
+  " Enable auto sign column. Make sure both sign and line number are displayed
+  set signcolumn=auto
+  redraw!
+  call assert_equal("=>  1 01234", s:ScreenLine(1, 1, 11))
+
+  " Test displaying signs in the number column with width 1
+  call sign_unplace('*')
+  call append(1, "abcde")
+  call append(2, "01234")
+  " Enable number column with width 1
+  set number numberwidth=1 signcolumn=auto
+  redraw!
+  call assert_equal("3 01234", s:ScreenLine(3, 1, 7))
+  " Place a sign and make sure number column width remains the same
+  sign place 20 line=2 name=sign1
+  redraw!
+  call assert_equal("=>2 abcde", s:ScreenLine(2, 1, 9))
+  call assert_equal("  3 01234", s:ScreenLine(3, 1, 9))
+  " Set 'signcolumn' to 'number', make sure the number column width increases
+  set signcolumn=number
+  redraw!
+  call assert_equal("=> abcde", s:ScreenLine(2, 1, 8))
+  call assert_equal(" 3 01234", s:ScreenLine(3, 1, 8))
+  " Set 'signcolumn' to 'auto', make sure the number column width is 1.
+  set signcolumn=auto
+  redraw!
+  call assert_equal("=>2 abcde", s:ScreenLine(2, 1, 9))
+  call assert_equal("  3 01234", s:ScreenLine(3, 1, 9))
+  " Set 'signcolumn' to 'number', make sure the number column width is 2.
+  set signcolumn=number
+  redraw!
+  call assert_equal("=> abcde", s:ScreenLine(2, 1, 8))
+  call assert_equal(" 3 01234", s:ScreenLine(3, 1, 8))
+  " Disable 'number' column
+  set nonumber
+  redraw!
+  call assert_equal("=>abcde", s:ScreenLine(2, 1, 7))
+  call assert_equal("  01234", s:ScreenLine(3, 1, 7))
+  " Enable 'number' column
+  set number
+  redraw!
+  call assert_equal("=> abcde", s:ScreenLine(2, 1, 8))
+  call assert_equal(" 3 01234", s:ScreenLine(3, 1, 8))
+  " Remove the sign and make sure the width of the number column is 1.
+  call sign_unplace('', {'id' : 20})
+  redraw!
+  call assert_equal("3 01234", s:ScreenLine(3, 1, 7))
+  " When the first sign is placed with 'signcolumn' set to number, verify that
+  " the number column width increases
+  sign place 30 line=1 name=sign1
+  redraw!
+  call assert_equal("=> 01234", s:ScreenLine(1, 1, 8))
+  call assert_equal(" 2 abcde", s:ScreenLine(2, 1, 8))
+  " Add sign with multi-byte text
+  set numberwidth=4
+  sign place 40 line=2 name=sign2
+  redraw!
+  call assert_equal(" => 01234", s:ScreenLine(1, 1, 9))
+  call assert_equal(" Ｖ abcde", s:ScreenLine(2, 1, 9))
+
+  sign unplace * group=*
+  sign undefine sign1
+  set signcolumn&
+  set number&
+  enew!  | close
 endfunc

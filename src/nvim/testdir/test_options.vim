@@ -1,6 +1,6 @@
 " Test for options
 
-function! Test_whichwrap()
+func Test_whichwrap()
   set whichwrap=b,s
   call assert_equal('b,s', &whichwrap)
 
@@ -266,9 +266,14 @@ func Test_set_errors()
   call assert_fails('set foldmarker=x', 'E536:')
   call assert_fails('set commentstring=x', 'E537:')
   call assert_fails('set complete=x', 'E539:')
+  call assert_fails('set rulerformat=%-', 'E539:')
+  call assert_fails('set rulerformat=%(', 'E542:')
+  call assert_fails('set rulerformat=%15(%%', 'E542:')
+  call assert_fails('set statusline=%$', 'E539:')
   call assert_fails('set statusline=%{', 'E540:')
-  call assert_fails('set statusline=' . repeat("%p", 81), 'E541:')
   call assert_fails('set statusline=%(', 'E542:')
+  call assert_fails('set statusline=%)', 'E542:')
+
   if has('cursorshape')
     " This invalid value for 'guicursor' used to cause Vim to crash.
     call assert_fails('set guicursor=i-ci,r-cr:h', 'E545:')
@@ -282,6 +287,21 @@ func Test_set_errors()
   call assert_fails('set winminwidth=10 winwidth=9', 'E592:')
   call assert_fails("set showbreak=\x01", 'E595:')
   call assert_fails('set t_foo=', 'E846:')
+  if has('python') || has('python3')
+    call assert_fails('set pyxversion=6', 'E474:')
+  endif
+  call assert_fails("let &tabstop='ab'", 'E521:')
+  call assert_fails('set sessionoptions=curdir,sesdir', 'E474:')
+  call assert_fails('set foldmarker={{{,', 'E474:')
+  call assert_fails('set sessionoptions=sesdir,curdir', 'E474:')
+  call assert_fails('set listchars=trail:· ambiwidth=double', 'E834:')
+  set listchars&
+  call assert_fails('set fillchars=stl:· ambiwidth=double', 'E835:')
+  set fillchars&
+  call assert_fails('set fileencoding=latin1,utf-8', 'E474:')
+  set nomodifiable
+  call assert_fails('set fileencoding=latin1', 'E21:')
+  set modifiable&
 endfunc
 
 " Must be executed before other tests that set 'term'.
@@ -346,6 +366,16 @@ func Test_set_values()
   " The file is only generated when running "make test" in the src directory.
   if filereadable('opt_test.vim')
     source opt_test.vim
+  endif
+endfunc
+
+func Test_renderoptions()
+  throw 'skipped: Nvim does not support renderoptions'
+  " Only do this for Windows Vista and later, fails on Windows XP and earlier.
+  " Doesn't hurt to do this on a non-Windows system.
+  if windowsversion() !~ '^[345]\.'
+    set renderoptions=type:directx
+    set rop=type:directx
   endif
 endfunc
 
@@ -561,3 +591,28 @@ func Test_visualbell()
   set novisualbell
   set belloff=all
 endfunc
+
+" Test for setting option values using v:false and v:true
+func Test_opt_boolean()
+  set number&
+  set number
+  call assert_equal(1, &nu)
+  set nonu
+  call assert_equal(0, &nu)
+  let &nu = v:true
+  call assert_equal(1, &nu)
+  let &nu = v:false
+  call assert_equal(0, &nu)
+  set number&
+endfunc
+
+" Test for setting option value containing spaces with isfname+=32
+func Test_isfname_with_options()
+  set isfname+=32
+  setlocal keywordprg=:term\ help.exe
+  call assert_equal(':term help.exe', &keywordprg)
+  set isfname&
+  setlocal keywordprg&
+endfunc
+
+" vim: shiftwidth=2 sts=2 expandtab

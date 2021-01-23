@@ -34,10 +34,13 @@
 #define utf_ptr2len(b) ((size_t)utf_ptr2len((char_u *)b))
 #define utf_char2len(b) ((size_t)utf_char2len(b))
 
+const char *const encode_bool_var_names[] = {
+  [kBoolVarTrue] = "true",
+  [kBoolVarFalse] = "false",
+};
+
 const char *const encode_special_var_names[] = {
   [kSpecialVarNull] = "null",
-  [kSpecialVarTrue] = "true",
-  [kSpecialVarFalse] = "false",
 };
 
 #ifdef INCLUDE_GENERATED_DECLARATIONS
@@ -156,8 +159,11 @@ static int conv_error(const char *const msg, const MPConvStack *const mpstack,
           vim_snprintf((char *)IObuff, IOSIZE, idx_msg, idx);
           ga_concat(&msg_ga, IObuff);
         } else {
-          typval_T key_tv = *TV_LIST_ITEM_TV(
-              tv_list_first(TV_LIST_ITEM_TV(li)->vval.v_list));
+          assert(li != NULL);
+          listitem_T *const first_item =
+            tv_list_first(TV_LIST_ITEM_TV(li)->vval.v_list);
+          assert(first_item != NULL);
+          typval_T key_tv = *TV_LIST_ITEM_TV(first_item);
           char *const key = encode_tv2echo(&key_tv, NULL);
           vim_snprintf((char *) IObuff, IOSIZE, key_pair_msg, key, idx);
           xfree(key);

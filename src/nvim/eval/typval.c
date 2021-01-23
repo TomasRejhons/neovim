@@ -16,6 +16,7 @@
 #include "nvim/eval/typval_encode.h"
 #include "nvim/eval.h"
 #include "nvim/eval/userfunc.h"
+#include "nvim/lua/executor.h"
 #include "nvim/types.h"
 #include "nvim/assert.h"
 #include "nvim/memory.h"
@@ -301,6 +302,7 @@ void tv_list_free_list(list_T *const l)
   }
   list_log(l, NULL, NULL, "freelist");
 
+  nlua_free_typval_list(l);
   xfree(l);
 }
 
@@ -638,6 +640,57 @@ tv_list_copy_error:
   return NULL;
 }
 
+/// Flatten "list" in place to depth "maxdepth".
+/// Does nothing if "maxdepth" is 0.
+///
+/// @param[in,out] list   List to flatten
+/// @param[in] maxdepth   Maximum depth that will be flattened
+///
+/// @return OK or FAIL
+int tv_list_flatten(list_T *list, long maxdepth)
+  FUNC_ATTR_NONNULL_ARG(1) FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  listitem_T *item;
+  listitem_T *to_free;
+  int n;
+  if (maxdepth == 0) {
+    return OK;
+  }
+
+  n = 0;
+  item = list->lv_first;
+  while (item != NULL) {
+    fast_breakcheck();
+    if (got_int) {
+      return FAIL;
+    }
+    if (item->li_tv.v_type == VAR_LIST) {
+      listitem_T *next = item->li_next;
+
+      tv_list_drop_items(list, item, item);
+      tv_list_extend(list, item->li_tv.vval.v_list, next);
+      tv_clear(&item->li_tv);
+      to_free = item;
+
+      if (item->li_prev == NULL) {
+        item = list->lv_first;
+      } else {
+        item = item->li_prev->li_next;
+      }
+      xfree(to_free);
+
+      if (++n >= maxdepth) {
+        n = 0;
+        item = next;
+      }
+    } else {
+      n = 0;
+      item = item->li_next;
+    }
+  }
+  return OK;
+}
+
 /// Extend first list with the second
 ///
 /// @param[out]  l1  List to extend.
@@ -672,7 +725,7 @@ int tv_list_concat(list_T *const l1, list_T *const l2, typval_T *const tv)
   list_T *l;
 
   tv->v_type = VAR_LIST;
-
+  tv->v_lock = VAR_UNLOCKED;
   if (l1 == NULL && l2 == NULL) {
     l = NULL;
   } else if (l1 == NULL) {
@@ -797,10 +850,14 @@ bool tv_list_equal(list_T *const l1, list_T *const l2, const bool ic,
   if (l1 == l2) {
     return true;
   }
-  if (l1 == NULL || l2 == NULL) {
+  if (tv_list_len(l1) != tv_list_len(l2)) {
     return false;
   }
-  if (tv_list_len(l1) != tv_list_len(l2)) {
+  if (tv_list_len(l1) == 0) {
+    // empty and NULL list are considered equal
+    return true;
+  }
+  if (l1 == NULL || l2 == NULL) {
     return false;
   }
 
@@ -1301,7 +1358,8 @@ void tv_dict_item_remove(dict_T *const dict, dictitem_T *const item)
 
 //{{{2 Alloc/free
 
-/// Allocate an empty dictionary
+/// Allocate an empty dictionary.
+/// Caller should take care of the reference count.
 ///
 /// @return [allocated] new dictionary.
 dict_T *tv_dict_alloc(void)
@@ -1374,6 +1432,7 @@ void tv_dict_free_dict(dict_T *const d)
     d->dv_used_next->dv_used_prev = d->dv_used_prev;
   }
 
+  nlua_free_typval_dict(d);
   xfree(d);
 }
 
@@ -1693,21 +1752,21 @@ int tv_dict_add_float(dict_T *const d, const char *const key,
   return OK;
 }
 
-/// Add a special entry to dictionary
+/// Add a boolean entry to dictionary
 ///
 /// @param[out]  d  Dictionary to add entry to.
 /// @param[in]  key  Key to add.
 /// @param[in]  key_len  Key length.
-/// @param[in]  val SpecialVarValue to add.
+/// @param[in]  val BoolVarValue to add.
 ///
 /// @return OK in case of success, FAIL when key already exists.
-int tv_dict_add_special(dict_T *const d, const char *const key,
-                        const size_t key_len, SpecialVarValue val)
+int tv_dict_add_bool(dict_T *const d, const char *const key,
+                     const size_t key_len, BoolVarValue val)
 {
   dictitem_T *const item = tv_dict_item_alloc_len(key, key_len);
 
-  item->di_tv.v_type = VAR_SPECIAL;
-  item->di_tv.vval.v_special = val;
+  item->di_tv.v_type = VAR_BOOL;
+  item->di_tv.vval.v_bool = val;
   if (tv_dict_add(d, item) == FAIL) {
     tv_dict_item_free(item);
     return FAIL;
@@ -1721,9 +1780,9 @@ int tv_dict_add_special(dict_T *const d, const char *const key,
 int tv_dict_add_str(dict_T *const d,
                     const char *const key, const size_t key_len,
                     const char *const val)
-  FUNC_ATTR_NONNULL_ALL
+  FUNC_ATTR_NONNULL_ARG(1, 2)
 {
-  return tv_dict_add_allocated_str(d, key, key_len, xstrdup(val));
+  return tv_dict_add_str_len(d, key, key_len, val, -1);
 }
 
 /// Add a string entry to dictionary
@@ -1737,10 +1796,10 @@ int tv_dict_add_str(dict_T *const d,
 /// @return OK in case of success, FAIL when key already exists.
 int tv_dict_add_str_len(dict_T *const d,
                         const char *const key, const size_t key_len,
-                        char *const val, int len)
+                        const char *const val, int len)
   FUNC_ATTR_NONNULL_ARG(1, 2)
 {
-  char *s = val ? val : "";
+  char *s = NULL;
   if (val != NULL) {
     s = (len < 0) ? xstrdup(val) : xstrndup(val, (size_t)len);
   }
@@ -1763,7 +1822,7 @@ int tv_dict_add_str_len(dict_T *const d,
 int tv_dict_add_allocated_str(dict_T *const d,
                               const char *const key, const size_t key_len,
                               char *const val)
-  FUNC_ATTR_NONNULL_ALL
+  FUNC_ATTR_NONNULL_ARG(1, 2)
 {
   dictitem_T *const item = tv_dict_item_alloc_len(key, key_len);
 
@@ -2013,12 +2072,15 @@ void tv_dict_alloc_ret(typval_T *const ret_tv)
 
 #define TYPVAL_ENCODE_CONV_NIL(tv) \
     do { \
-      tv->vval.v_special = kSpecialVarFalse; \
+      tv->vval.v_special = kSpecialVarNull; \
       tv->v_lock = VAR_UNLOCKED; \
     } while (0)
 
 #define TYPVAL_ENCODE_CONV_BOOL(tv, num) \
-    TYPVAL_ENCODE_CONV_NIL(tv)
+    do { \
+      tv->vval.v_bool = kBoolVarFalse; \
+      tv->v_lock = VAR_UNLOCKED; \
+    } while (0)
 
 #define TYPVAL_ENCODE_CONV_NUMBER(tv, num) \
     do { \
@@ -2293,6 +2355,7 @@ void tv_free(typval_T *tv)
         tv_dict_unref(tv->vval.v_dict);
         break;
       }
+      case VAR_BOOL:
       case VAR_SPECIAL:
       case VAR_NUMBER:
       case VAR_FLOAT:
@@ -2324,6 +2387,7 @@ void tv_copy(const typval_T *const from, typval_T *const to)
   switch (from->v_type) {
     case VAR_NUMBER:
     case VAR_FLOAT:
+    case VAR_BOOL:
     case VAR_SPECIAL: {
       break;
     }
@@ -2425,6 +2489,7 @@ void tv_item_lock(typval_T *const tv, const int deep, const bool lock)
     case VAR_STRING:
     case VAR_FUNC:
     case VAR_PARTIAL:
+    case VAR_BOOL:
     case VAR_SPECIAL: {
       break;
     }
@@ -2588,6 +2653,9 @@ bool tv_equal(typval_T *const tv1, typval_T *const tv2, const bool ic,
       const char *s2 = tv_get_string_buf(tv2, buf2);
       return mb_strcmp_ic((bool)ic, s1, s2) == 0;
     }
+    case VAR_BOOL: {
+      return tv1->vval.v_bool == tv2->vval.v_bool;
+    }
     case VAR_SPECIAL: {
       return tv1->vval.v_special == tv2->vval.v_special;
     }
@@ -2638,6 +2706,10 @@ bool tv_check_str_or_nr(const typval_T *const tv)
       EMSG(_("E728: Expected a Number or a String, Dictionary found"));
       return false;
     }
+    case VAR_BOOL: {
+      EMSG(_("E5299: Expected a Number or a String, Boolean found"));
+      return false;
+    }
     case VAR_SPECIAL: {
       EMSG(_("E5300: Expected a Number or a String"));
       return false;
@@ -2677,6 +2749,7 @@ bool tv_check_num(const typval_T *const tv)
 {
   switch (tv->v_type) {
     case VAR_NUMBER:
+    case VAR_BOOL:
     case VAR_SPECIAL:
     case VAR_STRING: {
       return true;
@@ -2721,6 +2794,7 @@ bool tv_check_str(const typval_T *const tv)
 {
   switch (tv->v_type) {
     case VAR_NUMBER:
+    case VAR_BOOL:
     case VAR_SPECIAL:
     case VAR_STRING: {
       return true;
@@ -2791,8 +2865,11 @@ varnumber_T tv_get_number_chk(const typval_T *const tv, bool *const ret_error)
       }
       return n;
     }
+    case VAR_BOOL: {
+      return tv->vval.v_bool == kBoolVarTrue ? 1 : 0;
+    }
     case VAR_SPECIAL: {
-      return tv->vval.v_special == kSpecialVarTrue ? 1 : 0;
+      return 0;
     }
     case VAR_UNKNOWN: {
       emsgf(_(e_intern2), "tv_get_number(UNKNOWN)");
@@ -2860,6 +2937,10 @@ float_T tv_get_float(const typval_T *const tv)
       EMSG(_("E894: Using a Dictionary as a Float"));
       break;
     }
+    case VAR_BOOL: {
+      EMSG(_("E362: Using a boolean value as a Float"));
+      break;
+    }
     case VAR_SPECIAL: {
       EMSG(_("E907: Using a special value as a Float"));
       break;
@@ -2870,6 +2951,19 @@ float_T tv_get_float(const typval_T *const tv)
     }
   }
   return 0;
+}
+
+// Give an error and return FAIL unless "tv" is a non-empty string.
+int tv_check_for_string(const typval_T *const tv)
+  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT FUNC_ATTR_PURE
+{
+  if (tv->v_type != VAR_STRING
+      || tv->vval.v_string == NULL
+      || *tv->vval.v_string == NUL) {
+    EMSG(_(e_stringreq));
+    return FAIL;
+  }
+  return OK;
 }
 
 /// Get the string value of a "stringish" VimL object.
@@ -2896,6 +2990,10 @@ const char *tv_get_string_buf_chk(const typval_T *const tv, char *const buf)
         return (const char *)tv->vval.v_string;
       }
       return "";
+    }
+    case VAR_BOOL: {
+      STRCPY(buf, encode_bool_var_names[tv->vval.v_bool]);
+      return buf;
     }
     case VAR_SPECIAL: {
       STRCPY(buf, encode_special_var_names[tv->vval.v_special]);

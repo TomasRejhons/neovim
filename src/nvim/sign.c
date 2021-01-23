@@ -173,13 +173,15 @@ static void insert_sign(
     const char_u *group,    // sign group; NULL for global group
     int prio,               // sign priority
     linenr_T lnum,          // line number which gets the mark
-    int typenr              // typenr of sign we are adding
+    int typenr,             // typenr of sign we are adding
+    bool has_text_or_icon   // sign has text or icon
 )
 {
   signlist_T *newsign = xmalloc(sizeof(signlist_T));
   newsign->id = id;
   newsign->lnum = lnum;
   newsign->typenr = typenr;
+  newsign->has_text_or_icon = has_text_or_icon;
   if (group != NULL) {
     newsign->group = sign_group_ref(group);
   } else {
@@ -210,13 +212,14 @@ static void insert_sign(
 
 /// Insert a new sign sorted by line number and sign priority.
 static void insert_sign_by_lnum_prio(
-    buf_T *buf,           // buffer to store sign in
-    signlist_T *prev,     // previous sign entry
-    int id,               // sign ID
-    const char_u *group,  // sign group; NULL for global group
-    int prio,             // sign priority
-    linenr_T lnum,        // line number which gets the mark
-    int typenr            // typenr of sign we are adding
+    buf_T *buf,            // buffer to store sign in
+    signlist_T *prev,      // previous sign entry
+    int id,                // sign ID
+    const char_u *group,   // sign group; NULL for global group
+    int prio,              // sign priority
+    linenr_T lnum,         // line number which gets the mark
+    int typenr,            // typenr of sign we are adding
+    bool has_text_or_icon  // sign has text or icon
 )
 {
   signlist_T  *sign;
@@ -234,7 +237,7 @@ static void insert_sign_by_lnum_prio(
     sign = prev->next;
   }
 
-  insert_sign(buf, prev, sign, id, group, prio, lnum, typenr);
+  insert_sign(buf, prev, sign, id, group, prio, lnum, typenr, has_text_or_icon);
 }
 
 /// Get the name of a sign by its typenr.
@@ -342,12 +345,13 @@ static void sign_sort_by_prio_on_line(buf_T *buf, signlist_T *sign)
 
 /// Add the sign into the signlist. Find the right spot to do it though.
 void buf_addsign(
-    buf_T *buf,     // buffer to store sign in
-    int id,         // sign ID
+    buf_T *buf,               // buffer to store sign in
+    int id,                   // sign ID
     const char_u *groupname,  // sign group
-    int prio,       // sign priority
-    linenr_T lnum,  // line number which gets the mark
-    int typenr      // typenr of sign we are adding
+    int prio,                 // sign priority
+    linenr_T lnum,            // line number which gets the mark
+    int typenr,               // typenr of sign we are adding
+    bool has_text_or_icon     // sign has text or icon
 )
 {
   signlist_T *sign;    // a sign in the signlist
@@ -363,13 +367,29 @@ void buf_addsign(
       sign_sort_by_prio_on_line(buf, sign);
       return;
     } else if (lnum < sign->lnum) {
-      insert_sign_by_lnum_prio(buf, prev, id, groupname, prio, lnum, typenr);
+      insert_sign_by_lnum_prio(
+          buf,
+          prev,
+          id,
+          groupname,
+          prio,
+          lnum,
+          typenr,
+          has_text_or_icon);
       return;
     }
     prev = sign;
   }
 
-  insert_sign_by_lnum_prio(buf, prev, id, groupname, prio, lnum, typenr);
+  insert_sign_by_lnum_prio(
+      buf,
+      prev,
+      id,
+      groupname,
+      prio,
+      lnum,
+      typenr,
+      has_text_or_icon);
 }
 
 // For an existing, placed sign "markId" change the type to "typenr".
@@ -786,10 +806,14 @@ static int sign_define_init_text(sign_T *sp, char_u *text)
     }
     cells += utf_ptr2cells(s);
   }
-  // Currently must be one or two display cells
-  if (s != endp || cells < 1 || cells > 2) {
+  // Currently must be empty, one or two display cells
+  if (s != endp || cells > 2) {
     EMSG2(_("E239: Invalid sign text: %s"), text);
     return FAIL;
+  }
+  if (cells < 1) {
+    sp->sn_text = NULL;
+    return OK;
   }
 
   xfree(sp->sn_text);
@@ -881,6 +905,17 @@ int sign_undefine_by_name(const char_u *name)
   return OK;
 }
 
+static void may_force_numberwidth_recompute(buf_T *buf, int unplace)
+{
+  FOR_ALL_TAB_WINDOWS(tp, wp)
+    if (wp->w_buffer == buf
+        && (wp->w_p_nu || wp->w_p_rnu)
+        && (unplace || wp->w_nrwidth_width < 2)
+        && (*wp->w_p_scl == 'n' && *(wp->w_p_scl + 1) == 'u')) {
+      wp->w_nrwidth_line_count = 0;
+    }
+}
+
 /// List the signs matching 'name'
 static void sign_list_by_name(char_u *name)
 {
@@ -928,13 +963,25 @@ int sign_place(
   if (lnum > 0) {
     // ":sign place {id} line={lnum} name={name} file={fname}":
     // place a sign
-    buf_addsign(buf, *sign_id, sign_group, prio, lnum, sp->sn_typenr);
+    bool has_text_or_icon = sp->sn_text != NULL || sp->sn_icon != NULL;
+    buf_addsign(
+        buf,
+        *sign_id,
+        sign_group,
+        prio,
+        lnum,
+        sp->sn_typenr,
+        has_text_or_icon);
   } else {
     // ":sign place {id} file={fname}": change sign type
     lnum = buf_change_sign_type(buf, *sign_id, sign_group, sp->sn_typenr);
   }
   if (lnum > 0) {
     redraw_buf_line_later(buf, lnum);
+
+    // When displaying signs in the 'number' column, if the width of the
+    // number column is less than 2, then force recomputing the width.
+    may_force_numberwidth_recompute(buf, false);
   } else {
     EMSG2(_("E885: Not possible to change sign %s"), sign_name);
     return FAIL;
@@ -962,6 +1009,13 @@ int sign_unplace(int sign_id, char_u *sign_group, buf_T *buf, linenr_T atlnum)
       return FAIL;
     }
     redraw_buf_line_later(buf, lnum);
+  }
+
+  // When all the signs in a buffer are removed, force recomputing the
+  // number column width (if enabled) in all the windows displaying the
+  // buffer if 'signcolumn' is set to 'number' in that window.
+  if (buf->b_signlist == NULL) {
+    may_force_numberwidth_recompute(buf, true);
   }
 
   return OK;

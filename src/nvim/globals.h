@@ -92,6 +92,10 @@ EXTERN struct nvim_stats_s {
 EXTERN int Rows INIT(= DFLT_ROWS);     // nr of rows in the screen
 EXTERN int Columns INIT(= DFLT_COLS);  // nr of columns in the screen
 
+EXTERN NS ns_hl_active INIT(= 0);         // current ns that defines highlights
+EXTERN bool ns_hl_changed INIT(= false);  // highlight need update
+
+
 // We use 64-bit file functions here, if available.  E.g. ftello() returns
 // off_t instead of long, which helps if long is 32 bit and off_t is 64 bit.
 // We assume that when fseeko() is available then ftello() is too.
@@ -124,8 +128,6 @@ typedef off_t off_T;
 // held down based on the MOD_MASK_* symbols that are read first.
 EXTERN int mod_mask INIT(= 0x0);  // current key modifiers
 
-
-EXTERN bool lua_attr_active INIT(= false);
 
 // Cmdline_row is the row where the command line starts, just below the
 // last window.
@@ -203,16 +205,18 @@ EXTERN int msg_nowait INIT(= false);        // don't wait for this msg
 EXTERN int emsg_off INIT(= 0);              // don't display errors for now,
                                             // unless 'debug' is set.
 EXTERN int info_message INIT(= false);      // printing informative message
-EXTERN int msg_hist_off INIT(= false);      // don't add messages to history
+EXTERN bool msg_hist_off INIT(= false);     // don't add messages to history
 EXTERN int need_clr_eos INIT(= false);      // need to clear text before
                                             // displaying a message.
 EXTERN int emsg_skip INIT(= 0);             // don't display errors for
                                             // expression that is skipped
-EXTERN int emsg_severe INIT(= false);       // use message of next of several
+EXTERN bool emsg_severe INIT(= false);      // use message of next of several
                                             //  emsg() calls for throw
 EXTERN int did_endif INIT(= false);         // just had ":endif"
 EXTERN dict_T vimvardict;                   // Dictionary with v: variables
 EXTERN dict_T globvardict;                  // Dictionary with g: variables
+/// g: value
+#define globvarht globvardict.dv_hashtab
 EXTERN int did_emsg;                        // set by emsg() when the message
                                             // is displayed or thrown
 EXTERN bool called_vim_beep;                // set if vim_beep() is called
@@ -353,9 +357,11 @@ EXTERN int t_colors INIT(= 256);                // int value of T_CCO
 // position.  Search_match_lines is the number of lines after the match (0 for
 // a match within one line), search_match_endcol the column number of the
 // character just after the match in the last line.
-EXTERN int highlight_match INIT(= false);       // show search match pos
-EXTERN linenr_T search_match_lines;             // lines of of matched string
-EXTERN colnr_T search_match_endcol;             // col nr of match end
+EXTERN bool highlight_match INIT(= false);         // show search match pos
+EXTERN linenr_T search_match_lines;                // lines of of matched string
+EXTERN colnr_T search_match_endcol;                // col nr of match end
+EXTERN linenr_T search_first_line INIT(= 0);       // for :{FIRST},{last}s/pat
+EXTERN linenr_T search_last_line INIT(= MAXLNUM);  // for :{first},{LAST}s/pat
 
 EXTERN int no_smartcase INIT(= false);          // don't use 'smartcase' once
 
@@ -478,6 +484,8 @@ EXTERN int sc_col;              // column for shown command
 EXTERN int starting INIT(= NO_SCREEN);
 // true when planning to exit. Might keep running if there is a changed buffer.
 EXTERN bool exiting INIT(= false);
+// internal value of v:dying
+EXTERN int v_dying INIT(= 0);
 // is stdin a terminal?
 EXTERN int stdin_isatty INIT(= true);
 // is stdout a terminal?
@@ -485,9 +493,6 @@ EXTERN int stdout_isatty INIT(= true);
 // true when doing full-screen output, otherwise only writing some messages.
 // volatile because it is used in a signal handler.
 EXTERN volatile int full_screen INIT(= false);
-
-// When started in restricted mode (-Z).
-EXTERN int restricted INIT(= false);
 
 /// Non-zero when only "safe" commands are allowed, e.g. when sourcing .exrc or
 /// .vimrc in current directory.
@@ -582,8 +587,8 @@ EXTERN int vr_lines_changed INIT(= 0);      // #Lines changed by "gR" so far
 EXTERN int inhibit_delete_count INIT(= 0);
 
 // These flags are set based upon 'fileencoding'.
-// Note that "enc_utf8" is also set for "unicode", because the characters are
-// internally stored as UTF-8 (to avoid trouble with NUL bytes).
+// The characters are internally stored as UTF-8
+// to avoid trouble with NUL bytes.
 # define DBCS_JPN       932     // japan
 # define DBCS_JPNU      9932    // euc-jp
 # define DBCS_KOR       949     // korea
@@ -594,12 +599,6 @@ EXTERN int inhibit_delete_count INIT(= 0);
 # define DBCS_CHTU      9950    // euc-tw
 # define DBCS_2BYTE     1       // 2byte-
 # define DBCS_DEBUG     -1
-
-// mbyte flags that used to depend on 'encoding'. These are now deprecated, as
-// 'encoding' is always "utf-8". Code that use them can be refactored to
-// remove dead code.
-#define enc_utf8 true
-#define has_mbyte true
 
 /// Encoding used when 'fencs' is set to "default"
 EXTERN char_u *fenc_default INIT(= NULL);
@@ -867,7 +866,6 @@ EXTERN char_u e_failed[] INIT(= N_("E472: Command failed"));
 EXTERN char_u e_internal[] INIT(= N_("E473: Internal error"));
 EXTERN char_u e_intern2[] INIT(= N_("E685: Internal error: %s"));
 EXTERN char_u e_interr[] INIT(= N_("Interrupted"));
-EXTERN char_u e_invaddr[] INIT(= N_("E14: Invalid address"));
 EXTERN char_u e_invarg[] INIT(= N_("E474: Invalid argument"));
 EXTERN char_u e_invarg2[] INIT(= N_("E475: Invalid argument: %s"));
 EXTERN char_u e_invargval[] INIT(= N_("E475: Invalid value for argument %s"));
@@ -938,9 +936,12 @@ EXTERN char_u e_readonly[] INIT(= N_(
     "E45: 'readonly' option is set (add ! to override)"));
 EXTERN char_u e_readonlyvar[] INIT(= N_(
     "E46: Cannot change read-only variable \"%.*s\""));
+EXTERN char_u e_stringreq[] INIT(= N_("E928: String required"));
 EXTERN char_u e_dictreq[] INIT(= N_("E715: Dictionary required"));
-EXTERN char_u e_toomanyarg[] INIT(= N_("E118: Too many arguments for function: %s"));
-EXTERN char_u e_dictkey[] INIT(= N_("E716: Key not present in Dictionary: %s"));
+EXTERN char_u e_toomanyarg[] INIT(= N_(
+    "E118: Too many arguments for function: %s"));
+EXTERN char_u e_dictkey[] INIT(= N_(
+    "E716: Key not present in Dictionary: \"%s\""));
 EXTERN char_u e_listreq[] INIT(= N_("E714: List required"));
 EXTERN char_u e_listdictarg[] INIT(= N_(
     "E712: Argument of %s must be a List or Dictionary"));
@@ -1052,5 +1053,8 @@ typedef enum {
 
 #define MIN_CD_SCOPE  kCdScopeWindow
 #define MAX_CD_SCOPE  kCdScopeGlobal
+
+// Only filled for Win32.
+EXTERN char windowsVersion[20] INIT(= { 0 });
 
 #endif  // NVIM_GLOBALS_H

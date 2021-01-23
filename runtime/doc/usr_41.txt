@@ -644,6 +644,7 @@ List manipulation:					*list-functions*
 	min()			minimum value in a List
 	count()			count number of times a value appears in a List
 	repeat()		repeat a List multiple times
+	flatten()		flatten a List
 
 Dictionary manipulation:				*dict-functions*
 	get()			get an entry without an error for a wrong key
@@ -722,6 +723,7 @@ Cursor and mark position:		*cursor-functions* *mark-functions*
 	getcurpos()		get position of the cursor
 	getpos()		get position of cursor, mark, etc.
 	setpos()		set position of cursor, mark, etc.
+	getmarklist()		list of global/local marks
 	byte2line()		get line number at a specific byte count
 	line2byte()		byte count at a specific line
 	diff_filler()		get the number of filler lines above a line

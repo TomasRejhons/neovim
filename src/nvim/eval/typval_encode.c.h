@@ -364,7 +364,7 @@ static int _TYPVAL_ENCODE_CONVERT_ONE_VALUE(
       _TYPVAL_ENCODE_DO_CHECK_SELF_REFERENCE(tv->vval.v_list, lv_copyID, copyID,
                                              kMPConvList);
       TYPVAL_ENCODE_CONV_LIST_START(tv, tv_list_len(tv->vval.v_list));
-      assert(saved_copyID != copyID && saved_copyID != copyID - 1);
+      assert(saved_copyID != copyID);
       _mp_push(*mpstack, ((MPConvStackVal) {
         .type = kMPConvList,
         .tv = tv,
@@ -379,15 +379,20 @@ static int _TYPVAL_ENCODE_CONVERT_ONE_VALUE(
       TYPVAL_ENCODE_CONV_REAL_LIST_AFTER_START(tv, _mp_last(*mpstack));
       break;
     }
+    case VAR_BOOL: {
+      switch (tv->vval.v_bool) {
+        case kBoolVarTrue:
+        case kBoolVarFalse: {
+          TYPVAL_ENCODE_CONV_BOOL(tv, tv->vval.v_bool == kBoolVarTrue);
+          break;
+        }
+      }
+      break;
+    }
     case VAR_SPECIAL: {
       switch (tv->vval.v_special) {
         case kSpecialVarNull: {
           TYPVAL_ENCODE_CONV_NIL(tv);  // -V1037
-          break;
-        }
-        case kSpecialVarTrue:
-        case kSpecialVarFalse: {
-          TYPVAL_ENCODE_CONV_BOOL(tv, tv->vval.v_special == kSpecialVarTrue);
           break;
         }
       }

@@ -3,7 +3,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$isPullRequest = ($env:APPVEYOR_PULL_REQUEST_HEAD_COMMIT -ne $null)
 $env:CONFIGURATION -match '^(?<compiler>\w+)_(?<bits>32|64)(?:-(?<option>\w+))?$'
 $compiler = $Matches.compiler
 $compileOption = if ($Matches -contains 'option') {$Matches.option} else {''}
@@ -29,27 +28,9 @@ function exitIfFailed() {
   }
 }
 
-# https://github.com/lukesampson/scoop#installation
-$scoop = (New-Object System.Net.WebClient).DownloadString('https://get.scoop.sh')
-& {
-  Set-StrictMode -Off
-  Invoke-Expression $scoop
-}
-
-scoop install perl
-perl --version
-cpanm.bat --version
-
 if (-not $NoTests) {
-  scoop install nodejs-lts
   node --version
   npm.cmd --version
-
-  cpanm.bat -n Neovim::Ext
-  if ($LastExitCode -ne 0) {
-    Get-Content -Path "$env:USERPROFILE\.cpanm\build.log"
-  }
-  perl -W -e 'use Neovim::Ext; print $Neovim::Ext::VERSION'; exitIfFailed
 }
 
 if (-Not (Test-Path -PathType container $env:DEPS_BUILD_DIR)) {
@@ -106,17 +87,17 @@ elseif ($compiler -eq 'MSVC') {
 
 if (-not $NoTests) {
   # Setup python (use AppVeyor system python)
-  C:\Python27\python.exe -m pip install pynvim ; exitIfFailed
-  C:\Python35\python.exe -m pip install pynvim ; exitIfFailed
+
+  C:\hostedtoolcache\windows\Python\2.7.18\x64\python.exe -m pip install pynvim ; exitIfFailed
+  C:\hostedtoolcache\windows\Python\3.5.4\x64\python.exe -m pip install pynvim ; exitIfFailed
   # Disambiguate python3
-  move c:\Python35\python.exe c:\Python35\python3.exe
-  $env:PATH = "C:\Python35;C:\Python27;$env:PATH"
+  move C:\hostedtoolcache\windows\Python\3.5.4\x64\python.exe C:\hostedtoolcache\windows\Python\3.5.4\x64\python3.exe
+  $env:PATH = "C:\hostedtoolcache\windows\Python\3.5.4\x64;C:\hostedtoolcache\windows\Python\2.7.18\x64;$env:PATH"
   # Sanity check
   python  -c "import pynvim; print(str(pynvim))" ; exitIfFailed
   python3 -c "import pynvim; print(str(pynvim))" ; exitIfFailed
 
-  $env:PATH = "C:\Ruby24\bin;$env:PATH"
-  gem.cmd install neovim
+  gem.cmd install --pre neovim
   Get-Command -CommandType Application neovim-ruby-host.bat
 
   npm.cmd install -g neovim
